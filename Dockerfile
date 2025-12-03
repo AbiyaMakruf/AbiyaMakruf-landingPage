@@ -1,50 +1,76 @@
-FROM php:8.2-fpm
+# ============================================
+# 1. Stage 1 - Build Frontend Assets (Node)
+# ============================================
+FROM node:20-slim AS build
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    git \
-    curl \
-    libpng-dev \
-    libonig-dev \
-    libxml2-dev \
-    zip \
-    unzip \
-    libpq-dev \
-    nginx \
-    supervisor \
-    nodejs \
-    npm
+# Terima ARGumen build untuk kunci Pusher
+# Ini akan disuntikkan dari GitHub Actions
+ARG VITE_PUSHER_APP_KEY
 
-# Clear cache
-RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+# Working directory
+WORKDIR /app
 
-# Install PHP extensions
-RUN docker-php-ext-install pdo_pgsql mbstring exif pcntl bcmath gd
+# Copy package files dan install dependencies
+COPY package*.json vite.config.* ./
+# Gunakan 'npm install' tanpa 'ci' jika Anda ingin cache lebih baik
+RUN npm install
 
-# Get latest Composer
-COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+# Copy semua source code untuk build
+COPY . .
 
-# Set working directory
+# Buat file .env sementara dari ARG yang diterima
+# Vite akan secara otomatis mengambil variabel yang diawali dengan VITE_ dari file .env
+RUN echo "VITE_PUSHER_APP_KEY=${VITE_PUSHER_APP_KEY}" > .env
+
+# Build Vite assets (public/build)
+# Proses ini sekarang menggunakan VITE_PUSHER_APP_KEY yang disuntikkan
+RUN npm run build
+
+# ============================================
+# 2. Stage 2 - Laravel + PHP-FPM + Nginx
+# ============================================
+FROM php:8.3-fpm
+
+# Working directory
 WORKDIR /var/www/html
 
-# Copy existing application directory contents
-COPY . /var/www/html
+# Install dependencies PHP dan Sistem
+RUN apt-get update && apt-get install -y \
+    nginx supervisor git unzip curl zip \
+    libpng-dev libjpeg-dev libfreetype6-dev libzip-dev libpq-dev \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j$(nproc) gd pdo pdo_pgsql zip bcmath \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install PHP dependencies
-RUN composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev
+# Install composer
+COPY --from=composer:2.7 /usr/bin/composer /usr/bin/composer
 
-# Install NPM dependencies and build assets
-RUN npm install && npm run build
+# Copy Laravel source code (termasuk .git, yang mungkin tidak ideal tapi sesuai dengan flow Anda)
+COPY . .
 
-# Configure Nginx
-COPY docker/nginx.conf /etc/nginx/sites-available/default
-COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+# Copy compiled frontend build dari tahap Node
+COPY --from=build /app/public/build /var/www/html/public/build
 
-# Set permissions
-RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
+# Install Laravel dependencies
+RUN composer install --no-dev --optimize-autoloader
 
-# Expose port 8080 (Cloud Run default)
+# Add custom PHP upload limits
+COPY ./docker/custom.ini /usr/local/etc/php/conf.d/custom-upload-limits.ini
+
+# Optimize Laravel
+RUN php artisan config:clear && php artisan cache:clear
+
+# Link storage and set permissions
+RUN php artisan storage:link \
+    && chown -R www-data:www-data storage bootstrap/cache
+
+# Copy Nginx & Supervisor config
+COPY ./docker/nginx.conf /etc/nginx/nginx.conf
+COPY ./docker/default.conf /etc/nginx/sites-available/default
+COPY ./docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# Expose port yang akan digunakan Nginx
 EXPOSE 8080
 
-# Start Supervisor
-CMD ["/usr/bin/supervisord"]
+# Command utama untuk menjalankan Supervisor
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
