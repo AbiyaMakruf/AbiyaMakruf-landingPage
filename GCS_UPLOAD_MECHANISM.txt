@@ -1,0 +1,75 @@
+### Mekanisme Upload Image ke Google Cloud Storage (GCS)
+
+Project ini menggunakan pendekatan **Custom Service Class** untuk menangani interaksi dengan Google Cloud Storage, alih-alih menggunakan driver filesystem bawaan Laravel secara langsung untuk logika utamanya.
+
+#### 1. Core Logic: `App\Services\GoogleCloudStorage`
+Seluruh logika upload terpusat pada class `App\Services\GoogleCloudStorage.php`. Service ini menangani autentikasi dan request HTTP ke Google Cloud API secara manual.
+
+*   **Autentikasi (JWT & OAuth 2.0):**
+    *   Service ini tidak menggunakan library client Google Cloud PHP standar.
+    *   Service membuat **JWT (JSON Web Token)** secara manual menggunakan `client_email` dan `private_key` dari Service Account.
+    *   JWT ditandatangani (signed) dengan algoritma **RS256**.
+    *   JWT tersebut kemudian ditukarkan dengan **Access Token** melalui endpoint `https://oauth2.googleapis.com/token`.
+    *   Token ini di-cache sementara di properti class untuk efisiensi.
+
+*   **Proses Upload:**
+    *   Menggunakan Laravel HTTP Client (`Illuminate\Support\Facades\Http`) untuk mengirim request `POST` ke endpoint JSON API GCS:
+        `https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o`
+    *   Parameter query yang dikirim: `uploadType=media`, `name={path_file}`, `predefinedAcl=publicRead`.
+    *   Body request berisi konten raw dari file (`$file->get()`).
+    *   Mengembalikan URL publik file setelah berhasil diupload.
+
+#### 2. Konfigurasi & Environment
+Kredensial disimpan dalam file `.env` dan dimuat melalui `config/services.php`.
+
+*   **File `.env`:**
+    ```dotenv
+    GOOGLE_CLOUD_PROJECT_ID=...
+    GOOGLE_CLOUD_STORAGE_BUCKET=tracker-expenses
+    GOOGLE_CLOUD_CLIENT_EMAIL=...
+    GOOGLE_CLOUD_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----...-----END PRIVATE KEY-----"
+    ```
+*   **File `config/services.php`:**
+    Mengambil nilai dari env di atas ke dalam array key `gcs`.
+
+#### 3. Implementasi pada Fitur (Livewire)
+Service ini di-inject langsung ke dalam method di komponen Livewire.
+
+*   **Contoh Usage (Profile Photo - `app/Livewire/Profile/Index.php`):**
+    Terdapat logika kondisional berdasarkan environment:
+    *   **Local Environment:** Menggunakan disk `public` lokal (`storage/app/public`).
+    *   **Production/Cloud:** Menggunakan service `GoogleCloudStorage` untuk upload ke bucket.
+    ```php
+    public function saveProfile(GoogleCloudStorage $gcs): void
+    {
+        // ... validasi ...
+        if (app()->environment('local')) {
+            // Upload Local
+            $path = $this->photo->storeAs('profile-photos', $name, 'public');
+        } else {
+            // Upload GCS via Service
+            $url = $gcs->upload($this->photo, 'profile-photos/' . $name);
+        }
+    }
+    ```
+
+*   **Contoh Usage (Receipts - `app/Livewire/Transactions/AddRecord.php`):**
+    Menggunakan service secara langsung untuk mengupload bukti transaksi.
+    ```php
+    public function save(GoogleCloudStorage $gcs): void
+    {
+        // ...
+        if ($this->receipt) {
+            $path = 'receipts/' . Str::random(40) . '.' . $extension;
+            $attachmentPath = $gcs->upload($this->receipt, $path);
+        }
+        // ...
+    }
+    ```
+
+#### 4. Ringkasan Alur Data
+1.  User memilih file di frontend (Livewire temporary upload).
+2.  File diterima di server sebagai instance `Illuminate\Http\UploadedFile`.
+3.  Controller/Component memanggil method `$gcs->upload($file, $path)`.
+4.  Service `GoogleCloudStorage` melakukan handshake auth ke Google -> Mendapat Token -> Upload File via HTTP POST.
+5.  URL publik file disimpan ke database.
